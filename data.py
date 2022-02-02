@@ -18,11 +18,15 @@ from config import cfg
 from DAMSM import RNN_ENCODER
 from nltk.tokenize import RegexpTokenizer
 import pickle
+import torchvision.transforms as transforms
 
 #keywords = ['ski', 'baseball', 'motor','tennis','skateboard','kite']
-keywords = ['baseball', 'skateboard', 'surf','ski']
+keywords = ['baseball',  'surf', 'ski', 'snow','tennis','kite','frisbee']
+#keywords = ['baseball', 'ski']
 #keywords = ['frisbee','skateboard', 'tennis', 'ski']
 not_keywords = ["stand", "sit", "walk", "observ", "parked", "picture", "photo", "post"]
+
+num_cap_from_one_img = 5
 
 
 def getEFTCaption(cfg):
@@ -82,7 +86,18 @@ def saveImgOrNot(caption):
             save_this = True
             category = nk
     return save_this, category
+
+class AddGaussianNoise(object):
+    def __init__(self, mean=0., std=1., weight=0.05):
+        self.std = std
+        self.mean = mean
+        self.weight = weight
+        
+    def __call__(self, tensor):
+        return tensor + (torch.randn(tensor.size()) * self.std + self.mean)*self.weight
     
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 class TheDataset(torch.utils.data.Dataset):
     def __init__(self, cfg, eft_data_all, coco_caption, coco_keypoint, text_model=None, val=False):
@@ -90,6 +105,17 @@ class TheDataset(torch.utils.data.Dataset):
         self.cfg = cfg
         previous_img_ids = []
         self.img_size = cfg.IMG_SIZE
+        self.image_transform = transforms.Compose([
+            transforms.Resize([int(self.img_size), int(self.img_size * 1.5)]),
+            transforms.RandomCrop(self.img_size),
+            transforms.RandomHorizontalFlip()])
+        """self.image_transform = transforms.Compose([
+        transforms.Resize([int(self.img_size *1.1 ), int(self.img_size *1.1 )]),
+        transforms.RandomCrop(self.img_size),
+        transforms.RandomHorizontalFlip()])"""
+        self.normalize = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         ###########################################
         filenamepath = os.path.join('/media/remote_home/chang/thesis_rgbimg/coco', 'filenames.pickle')    
         with open(filenamepath, 'rb') as f:
@@ -112,34 +138,42 @@ class TheDataset(torch.utils.data.Dataset):
                 continue
             else:
                 previous_img_ids.append(img_id)
+            """previous_img_ids.append(img_id)"""
             # many captions for one img
             caption_ids = coco_caption.getAnnIds(imgIds=img_id)
             captions_anns = coco_caption.loadAnns(ids=caption_ids)
             
-            save_this, category = saveImgOrNot(captions_anns[0]['caption'])
+            """save_this, category = saveImgOrNot(captions_anns[0]['caption'])
             if not save_this:
-                continue
+                continue"""
+            category = 0
             # n caption with the same pose
-            for j, caption_ann in enumerate(captions_anns):
-                if j > 0:
-                    break
-                data = {'caption': caption_ann['caption'],
-                        'annotId': eft_data_all[i]['annotId'],
-                        'imageName': eft_data_all[i]['imageName'],
-                        'parm_pose': eft_data_all[i]['parm_pose'],
-                        'bbox': keypoint_ann['bbox'],
-                        'category': category}
-                data['rot_vec'] = np.array([rotation2so3(R) for R in data['parm_pose']])
-                kk = np.where(self.filenames == eft_data_all[i]['imageName'][:-4]) # remove ".jpg"
-                puOrNot = True
-                for gg in range(5):
-                    # 82783個filename 每個file有5個caption
-                    new_sent_ix = kk[0][0] * 5 + gg
-                    caption_index = self.captions[new_sent_ix]
-                    if 18-len(caption_index) < 0:    
-                        puOrNot = False                
-                if puOrNot:
-                    self.dataset.append(data)
+            
+            data = {'captions': [],
+                    'annotId': eft_data_all[i]['annotId'],
+                    'imageName': eft_data_all[i]['imageName'],
+                    'parm_pose': eft_data_all[i]['parm_pose'],
+                    'bbox': keypoint_ann['bbox'],
+                    'category': category}
+            imgFullPath =os.path.join('/media/remote_home/chang/datasets/coco/train2014', data['imageName'])
+            if os.path.exists(imgFullPath) ==False:
+                print(f"Img path is not valid: {imgFullPath}")
+                print(fsdfsd)
+            img  = Image.open(imgFullPath).convert('RGB')
+            width, height = img.size
+            w, h = data['bbox'][2], data['bbox'][3]
+            if w*h > width*height/3:
+                continue 
+            data['rot_vec'] = np.array([rotation2so3(R) for R in data['parm_pose']])
+            kk = np.where(self.filenames == eft_data_all[i]['imageName'][:-4]) # remove ".jpg"
+            for gg in range(5):
+                # 82783個filename 每個file有5個caption
+                new_sent_ix = kk[0][0] * 5 + gg
+                caption_index = self.captions[new_sent_ix]
+                if 10-len(caption_index) > 0:    
+                    data['captions'].append(self.captions[new_sent_ix])                
+            if len(data['captions']) > 0:                    
+                self.dataset.append(data)
     def __len__(self):
         return len(self.dataset)
 
@@ -149,22 +183,22 @@ class TheDataset(torch.utils.data.Dataset):
         #item['sentence'] = torch.tensor(data['sentence'], dtype=torch.float32)
         #item['sentence_wrong'] = self.get_sentence_wrong(index)
         item['image'] = self.get_image(data['imageName'], data['bbox'])
-        item['image_wrong'] = self.get_image_wrong(index)
+        #item['image_wrong'] = self.get_image_wrong(index)
         item['rot_vec'] = torch.tensor(data['rot_vec'], dtype=torch.float32)
-        #item['pose'] = self.get_pose(data['imageName'])
-        item['caption'], item['caption_len'] = self.get_caption_index(data['imageName'])
+        item['caption'], item['caption_len'] = self.get_caption_index(data['captions'], index)
         return item
     
-    def get_caption_index(self, imageName):
-        kk = np.where(self.filenames == imageName[:-4]) # remove ".jpg"
-        sent_ix = random.randint(0, 5-1)
+    def get_caption_index(self, captions, index):
+        #kk = np.where(self.filenames == imageName[:-4]) # remove ".jpg"
+        sent_ix = random.randint(0, len(captions)-1)
         # 82783個filename 每個file有5個caption
-        new_sent_ix = kk[0][0] * 5 + sent_ix
-        caption_index = self.captions[new_sent_ix]
-        if 18-len(caption_index) < 0:
+        #new_sent_ix = kk[0][0] * 5 + sent_ix
+        #caption_index = self.captions[new_sent_ix]
+        caption_index = captions[sent_ix]
+        if 10-len(caption_index) < 0:
             print(gfhfghfg)
         caption_len = len(caption_index)
-        caption_index = np.pad(caption_index, (0, 18-len(caption_index)))
+        caption_index = np.pad(caption_index, (0, 10-len(caption_index)))
         caption_index = np.expand_dims(caption_index, axis=0)
         return torch.tensor(caption_index.transpose(1,0)), torch.tensor(caption_len)
 
@@ -172,22 +206,8 @@ class TheDataset(torch.utils.data.Dataset):
         while True:
             data_random = self.dataset[random.choice(list(range(0, len(self.dataset))))]
             if data_random['category'] != self.dataset[index]['category']:
+            #if True:
                 return self.get_image(data_random['imageName'], data_random['bbox'])
-
-    def get_sentence_wrong(self, index):
-        while True:
-            data_random = self.dataset[random.choice(list(range(0, len(self.dataset))))]
-            if data_random['category'] != self.dataset[index]['category']:
-                return torch.tensor(data_random['sentence'], dtype=torch.float32)
-
-    def get_pose(self, imageName):
-        poseFullPath =os.path.join('/media/remote_home/chang/z_master-thesis/render_eft', imageName)
-        if os.path.exists(poseFullPath) ==False:
-            print(f"Pose path is not valid: {poseFullPath}")
-            print(fsdfsd)
-        img  = Image.open(poseFullPath).convert('L').resize((256, 256))
-        img = np.expand_dims(np.array(img, dtype=float), axis=-1).transpose(2, 0, 1)
-        return torch.tensor(img, dtype=torch.float32).sub_(127.5).div_(127.5)
 
     def get_image(self, imageName, bbox):
         imgFullPath =os.path.join('/media/remote_home/chang/datasets/coco/train2014', imageName)
@@ -195,34 +215,41 @@ class TheDataset(torch.utils.data.Dataset):
             print(f"Img path is not valid: {imgFullPath}")
             print(fsdfsd)
         img  = Image.open(imgFullPath).convert('RGB')
-        img = self.get_crop_img(img, bbox).resize((self.img_size, self.img_size))
-        img = np.array(img, dtype=float)
-        s = random.randint(0, 9)
-        if s > 4:
-            img = gaussian(img,sigma=1,multichannel=True).transpose(2, 0, 1)
-            #img = np.fliplr(img).transpose(2, 0, 1)
-            return torch.tensor(img.copy(), dtype=torch.float32).sub_(127.5).div_(127.5)
+        img = self.get_crop_img(img, bbox)
+        img = self.image_transform(img)
+        img = self.normalize(img)
+        ret = []
+        ret.append(img)
+        return ret
+        """img = np.array(img, dtype=float)
         img = img.transpose(2, 0, 1)
-        return torch.tensor(img, dtype=torch.float32).sub_(127.5).div_(127.5)
+        return torch.tensor(img, dtype=torch.float32).sub_(127.5).div_(127.5)"""
 
     def get_crop_img(self, img, bbox):
         width, height = img.size
-        r = int(np.maximum(bbox[2], bbox[3]) * 0.75)
-        center_x = int((2 * bbox[0] + bbox[2]) / 2)
+        
+        # bbox: (x, y, w, h)
+        max_side = int(np.maximum(bbox[2], bbox[3]))
+        r_h = max_side*0.8
+        r_w = max_side*1.2
+        center_x = int((2 * bbox[0] + bbox[2]) /  2)
         center_y = int((2 * bbox[1] + bbox[3]) / 2)
-        y1 = np.maximum(0, center_y - r)
+
+        y1 = np.maximum(0, center_y - r_h)
+        y2 = np.minimum(height, y1 + 2*r_h)
+        x1 = np.maximum(0, center_x - r_w)
+        x2 = np.minimum(width, x1 + 2*r_w)
+        
+        """y1 = np.maximum(0, center_y - r)
         y2 = np.minimum(height, center_y + r)
         x1 = np.maximum(0, center_x - r)
-        x2 = np.minimum(width, center_x + r)
+        x2 = np.minimum(width, center_x + r)"""
+        
         return img.crop([x1, y1, x2, y2])
 
     def get_caption_vector(self,text_model, caption):
         return text_model.get_sentence_vector(caption.replace('\n', '').lower())
-    
-
-        return img.transpose(2, 0, 1)
-
-
+ 
 if __name__ == "__main__":
     """coco_keypoint = COCO(cfg.COCO_keypoints_TRAIN)
     eft_data_all = getEFTCaption(cfg)

@@ -15,12 +15,12 @@ cfg = __C
 __C.SHARE_ENC = True
 __C.CUDA = True
 __C.USE_TENSORBOARD = True
-
+#241 traing g 2
 __C.START_FROM_EPOCH = 0#200
 __C.END_IN_EPOCH = 7000#1200
 __C.CHKPT_PATH = project_dir + '/models/checkpoints'
 __C.TB_DIR = project_dir + '/output/tensorboard'
-__C.SAVE_MODEL_ITR = 8
+__C.SAVE_MODEL_ITR = 5
 
 # training
 __C.N_TRAIN_D_1_TRAIN_G = 1# train discriminator k times before training generator

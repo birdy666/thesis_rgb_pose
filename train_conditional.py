@@ -17,152 +17,76 @@ c = 1
 
 
 def prepare_data(data, device):
-    imgs, captions, captions_lens, rot_vec = data
+    imgs, imgs_wrong, captions, captions_lens, rot_vec = data
     # sort data by the length in a decreasing order
     sorted_cap_lens, sorted_cap_indices = \
         torch.sort(captions_lens, 0, True)
 
-    """real_imgs = []
-    print(imgs.size())
-    print(sorted_cap_indices.size())
+    real_imgs = []
     for i in range(len(imgs)):
         imgs[i] = imgs[i][sorted_cap_indices]
-        real_imgs.append(Variable(imgs[i]).to(device))"""
-    imgs = imgs[sorted_cap_indices]
+        real_imgs.append(Variable(imgs[i]).to(device))
+    
+    if imgs_wrong != None:
+        wrong_imgs = []
+        for i in range(len(imgs_wrong)):
+            imgs_wrong[i] = imgs_wrong[i][sorted_cap_indices]
+            wrong_imgs.append(Variable(imgs_wrong[i]).to(device))
+    else:
+        wrong_imgs = None
+    
     captions = captions[sorted_cap_indices].squeeze()
     rot_vec = rot_vec[sorted_cap_indices]
     
     captions = Variable(captions).to(device)
     sorted_cap_lens = Variable(sorted_cap_lens).to(device)
+    rot_vec = Variable(rot_vec).to(device)
 
-    return [imgs, captions, sorted_cap_lens,rot_vec]
+    return [real_imgs, wrong_imgs, captions, sorted_cap_lens,rot_vec]
 
+def get_d_score(score):
+    return score.mean()
 
-def get_grad_penalty(batch_size, device, net_d, image, image_fake, sentence_match, rot_vec):  
-    epsilon = torch.rand(batch_size, dtype=torch.float32).to(device)  
-    ##########################
-    # get so3_interpolated
-    ##########################
-    fake_interpolated = torch.empty_like(image, dtype=torch.float32).to(device) 
-    for j in range(batch_size):
-        fake_interpolated[j] = epsilon[j] * image[j] + (1 - epsilon[j]) * image_fake[j]
-    
-    fake_interpolated = Variable(fake_interpolated, requires_grad=True)    
-    # calculate gradient penalty
-    score_interpolated_fake = net_d(fake_interpolated, sentence_match, rot_vec).mean()
-    gradient_fake = grad(outputs=score_interpolated_fake, 
-                    inputs=fake_interpolated, 
-                    grad_outputs=torch.ones_like(score_interpolated_fake).to(device),
-                    create_graph=True, 
-                    retain_graph=True)[0]
-    grad_fake_norm = torch.sqrt(torch.sum(gradient_fake.reshape(batch_size, -1) ** 2, dim=1) + 1e-5)
-    grad_penalty_fake = ((grad_fake_norm - 1) ** 2).mean()  
-    return grad_penalty_fake
-
-def get_d_score(so3_d):
-    so3_d = so3_d.masked_fill(so3_d == 0, -1e9)
-    pred = F.normalize(so3_d*so3_d, p=1, dim=-1)[:,:,:1]
-    return pred.mean()
+def get_grad_penalty(image, sent_emb, rot_vec, net_d, device):  
+    interpolated = (image.data).requires_grad_()
+    sent_inter = (sent_emb.data).requires_grad_()
+    rot_inter = (rot_vec.data).requires_grad_()
+    features = net_d(interpolated)
+    out = net_d.COND_DNET(features,sent_inter, rot_inter)
+    grads = torch.autograd.grad(outputs=out,
+                                inputs=(interpolated,sent_inter,rot_inter),
+                                grad_outputs=torch.ones(out.size()).to(device),
+                                retain_graph=True,
+                                create_graph=True,
+                                only_inputs=True)
+    grad0 = grads[0].view(grads[0].size(0), -1)
+    grad1 = grads[1].view(grads[1].size(0), -1)
+    grad2 = grads[2].view(grads[1].size(0), -1)
+    grad = torch.cat((grad0,grad1,grad2),dim=1)                        
+    grad_l2norm = torch.sqrt(torch.sum(grad ** 6, dim=1)) 
+    return torch.mean((grad_l2norm))
 
 def get_g_so3(output):
     return output
 
-def get_d_loss(cfg, device, net_g, net_d, batch, batch_index, optimizer_d=None, update_d=True, text_model=None):
-    if update_d:
-        net_d.zero_grad()
-    #sentence_match = batch.get('sentence').to(device) # torch.Size([128, 128])
-    caption = batch.get('caption').to(device)
-    caption_len = batch.get('caption_len').to(device)
-    image = batch.get('image').to(device)
-    image_mismatch = batch.get('image_wrong').to(device)
-    rot_vec = batch.get('rot_vec').to(device)
-    image, caption, caption_len,  rot_vec = prepare_data((image, caption, caption_len,  rot_vec), device)
-    if text_model == None:
-        print(dfsdf)
-    hidden = text_model.init_hidden(cfg.BATCH_SIZE)
-    # words_embs: batch_size x nef x seq_len
-    # sent_emb: batch_size x nef
-    words_embs, sent_emb = text_model(caption, caption_len, hidden)
-    words_embs, sent_emb = words_embs.detach(), sent_emb.detach()
-    noise = get_noise_tensor(cfg.BATCH_SIZE, cfg.NOISE_SIZE).to(device)
-    grad_penalty_fake = 0
-    grad_penalty_wrong = 0
-    score_fake = 0  
-    if update_d:  
-        # real
-        score_right = torch.nn.ReLU()(1.0 - net_d(image, sent_emb, rot_vec)).mean()
-        #score_right = net_d(image, sentence_match, rot_vec).mean()
-        # wrong
-        score_wrong = torch.nn.ReLU()(1.0 + net_d(image_mismatch, sent_emb, rot_vec)).mean()
-        #score_wrong = net_d(image_mismatch, sentence_match, rot_vec).mean()
-        # fake
-        image_fake = net_g(noise, sent_emb, rot_vec).detach() 
-        score_fake = torch.nn.ReLU()(1.0 + net_d(image_fake, sent_emb, rot_vec)).mean()       
-        #score_fake = net_d(image_fake, sentence_match, rot_vec).mean()
-
-        grad_penalty_fake = get_grad_penalty(cfg.BATCH_SIZE, device, net_d, image, image_fake, sent_emb, rot_vec)
-        loss_d = score_fake + score_wrong  + 2*score_right + 2 * grad_penalty_fake         
-        optimizer_d.zero_grad()
-        loss_d.backward()
-        optimizer_d.step()
-        if batch_index % 10 == 2:
-            #############################################################
-            im = Image.fromarray(image_fake[0].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/sample_0.jpg')
-            im = Image.fromarray(image_fake[10].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/sample_10.jpg')
-            im = Image.fromarray(image_fake[20].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/sample_20.jpg')
-            im = Image.fromarray(image_fake[22].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/sample_22.jpg')
-           
-            im = Image.fromarray(image[0].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/real_0.jpg')
-            im = Image.fromarray(image[10].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/real_10.jpg')
-            im = Image.fromarray(image[20].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/real_20.jpg')
-            im = Image.fromarray(image[22].data.mul_(127.5).add_(127.5).byte().permute(1, 2, 0).cpu().numpy())
-            im.save('/media/remote_home/chang/thesis_rgbimg/real_22.jpg')
-            
-            #############################################################            
-                
-    if update_d:
-        net_d.zero_grad()     
-    return score_fake, score_wrong, score_right, grad_penalty_fake, grad_penalty_wrong
-
-def get_g_loss(cfg, device, net_g, net_d, batch, optimizer_g=None, update_g=True, text_model=None):
-    if update_g:
-        net_g.zero_grad()
-
-    # get text vectors and noises
-    #sentence_match = batch.get('sentence').to(device) # torch.Size([128, 128])
-    image = batch.get('image').to(device)
-    rot_vec = batch.get('rot_vec').to(device)
-    caption = batch.get('caption').to(device)
-    caption_len = batch.get('caption_len').to(device)
-    hidden = text_model.init_hidden(cfg.BATCH_SIZE)
-    image, caption, caption_len,  rot_vec = prepare_data((image, caption, caption_len,  rot_vec), device)
-    # words_embs: batch_size x nef x seq_len
-    # sent_emb: batch_size x nef
-    words_embs, sent_emb = text_model(caption, caption_len, hidden)
-    words_embs, sent_emb = words_embs.detach(), sent_emb.detach()
-    noise = get_noise_tensor(cfg.BATCH_SIZE, cfg.NOISE_SIZE).to(device)
-
-    if update_g:
-        # so3 fake
-        image_fake = net_g(noise, sent_emb, rot_vec)
-        score_fake = net_d(image_fake, sent_emb, rot_vec).mean()
-        
-        # 'wgan', 'wgan-gp'
-        loss_g = - score_fake
-        optimizer_g.zero_grad()
-        loss_g.backward()
-        optimizer_g.step()    
+def safe_sample(real, fake):
+    for i in range(len(fake)):
+        if i % 3 == 0:
+            im = fake[i].data.cpu().numpy()
+            # [-1, 1] --> [0, 255]
+            im = (im + 1.0) * 127.5
+            im = im.astype(np.uint8)
+            im = np.transpose(im, (1, 2, 0))
+            im = Image.fromarray(im)
+            im.save('/media/remote_home/chang/thesis_rgbimg/sample_' + str(i) + '.jpg')
+            im = real[i].data.cpu().numpy()
+            # [-1, 1] --> [0, 255]
+            im = (im + 1.0) * 127.5
+            im = im.astype(np.uint8)
+            im = np.transpose(im, (1, 2, 0))
+            im = Image.fromarray(im)
+            im.save('/media/remote_home/chang/thesis_rgbimg/real_' + str(i) + '.jpg')
     
-    if update_g:
-        net_g.zero_grad()
-    return score_fake
 
 def train_epoch(cfg, device, net_g, net_d, optimizer_g, optimizer_d, dataLoader_train, tb_writer=None, e=None, text_model=None):
     #print('learning rate: g ' + str(optimizer_g._optimizer.param_groups[0].get('lr')) + ' d ' + str(optimizer_d._optimizer.param_groups[0].get('lr')))
@@ -172,32 +96,78 @@ def train_epoch(cfg, device, net_g, net_d, optimizer_g, optimizer_d, dataLoader_
     total_loss_d = 0
     if text_model == None:
         print(fdgfdg)
-
     
-    for i, batch in enumerate(tqdm(dataLoader_train, desc='  - (Training)   ', leave=False)):        
-        ###############################################################
-        # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-        ###############################################################
-        score_fake, score_wrong, score_right, grad_penalty_fake, grad_penalty_wrong = get_d_loss(cfg, device, net_g, net_d, batch, i, optimizer_d, text_model=text_model)         
-        loss_d = score_fake + score_wrong - 2 * score_right + 10 * grad_penalty_fake 
-        if i % cfg.N_TRAIN_ENC ==0:
-            total_loss_d += loss_d.item()
-            if tb_writer != None:
-                tb_writer.add_scalars('loss_d_', {'score_fake': score_fake, 'score_wrong': score_wrong, 'score_right': score_right, 'grad_penalty_fake': grad_penalty_fake, 'grad_penalty_wrong':grad_penalty_wrong}, e*len(dataLoader_train)+i)
-                tb_writer.add_scalars('loss_d_wf', {'R_W': score_right-score_wrong, 'W_F': score_wrong-score_fake, 'w_loss': score_right-score_fake}, e*len(dataLoader_train)+i)
+    for batch_index, batch in enumerate(tqdm(dataLoader_train, desc='  - (Training)   ', leave=False)):        
+        #sentence_match = batch.get('sentence').to(device) # torch.Size([128, 128])
+        captions = batch.get('caption')
+        caption_lens = batch.get('caption_len')
+        images = batch.get('image')
+        #images_wrong = batch.get('image_wrong')
+        images_wrong = None
+        rot_vecs = batch.get('rot_vec')
+        images, images_wrong, captions, caption_lens,  rot_vecs = prepare_data((images, images_wrong, captions, caption_lens,  rot_vecs), device)
+        if text_model == None:
+            print(dfsdf)
+        hidden = text_model.init_hidden(cfg.BATCH_SIZE)
+        # words_embs: batch_size x nef x seq_len
+        # sent_emb: batch_size x nef
+        _, sent_emb = text_model(captions, caption_lens, hidden)
+        sent_emb = sent_emb.detach()
         
-        ###############################################################
-        # (2) Update G network: maximize log(D(G(z)))
-        ###############################################################
-        # after training discriminator for N times, train gernerator for 1 time
-        if i % cfg.N_TRAIN_D_1_TRAIN_G == 0:            
-            #get losses
-            score_fake = get_g_loss(cfg, device, net_g, net_d, batch, optimizer_g, text_model=text_model)
-            loss_g =  - score_fake
-            total_loss_g += loss_g.item()
-            if tb_writer != None:
-                tb_writer.add_scalars('loss_g_', {'score_fake': score_fake}, e*len(dataLoader_train)+i)
-    return total_loss_g/ (cfg.BATCH_SIZE/cfg.N_TRAIN_D_1_TRAIN_G), total_loss_d/(cfg.BATCH_SIZE)
+        # real
+        images = images[0]
+        real_features = net_d(images)
+        output = net_d.COND_DNET(real_features,sent_emb,rot_vecs)
+        score_right = torch.nn.ReLU()(1.0 - output).mean()
+        # wrong
+        """images_wrong = images_wrong[0]
+        wrong_features = net_d(images_wrong)
+        output = net_d.COND_DNET(wrong_features, sent_emb, rot_vecs)"""
+        output = net_d.COND_DNET(real_features[:(cfg.BATCH_SIZE - 1)], sent_emb[1:cfg.BATCH_SIZE], rot_vecs[1:cfg.BATCH_SIZE])
+        score_wrong = torch.nn.ReLU()(1.0 + output).mean()
+        
+        # fake
+        noises = torch.randn(cfg.BATCH_SIZE, 100).to(device)
+        fake = net_g(noises,sent_emb, rot_vecs)  
+        fake_features = net_d(fake.detach()) 
+        output = net_d.COND_DNET(fake_features,sent_emb,rot_vecs) 
+        score_fake = torch.nn.ReLU()(1.0 + output).mean()     
+
+        loss_d = (score_fake + score_wrong)/2.0 + score_right   
+        optimizer_g.zero_grad()   
+        optimizer_d.zero_grad()
+        loss_d.backward()
+        optimizer_d.step()
+        
+        d_loss_gp = get_grad_penalty(images, sent_emb, rot_vecs, net_d, device)
+        d_loss_gp = 2.0 * d_loss_gp
+        optimizer_g.zero_grad()
+        optimizer_d.zero_grad()
+        d_loss_gp.backward()
+        optimizer_d.step()
+
+        # update G
+        for i in range(4):
+            noises = torch.randn(cfg.BATCH_SIZE, 100).to(device)
+            fake = net_g(noises,sent_emb, rot_vecs)
+            features = net_d(fake)
+            output = net_d.COND_DNET(features,sent_emb,rot_vecs)
+            loss_g = - output.mean()
+            optimizer_g.zero_grad()
+            optimizer_d.zero_grad()
+            loss_g.backward()
+            optimizer_g.step()
+
+        if batch_index % 20 == 2:
+            safe_sample(images, fake)
+            
+        
+        total_loss_d += loss_d.item()
+        total_loss_g += loss_g.item()
+        if tb_writer != None:
+            tb_writer.add_scalars('loss_d_', {'score_fake': score_fake-1, 'score_wrong': score_wrong-1, 'score_right': 1-score_right, 'grad_penalty': d_loss_gp}, e*len(dataLoader_train)+batch_index)
+
+    return total_loss_g/ (cfg.BATCH_SIZE), total_loss_d/(cfg.BATCH_SIZE)
 
 def train(cfg, device, net_g, net_d, optimizer_g, optimizer_d, dataLoader_train, dataLoader_val, text_model):   
     if text_model == None:

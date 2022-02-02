@@ -18,7 +18,7 @@ def get_input_mask(vectors, max_sentence_len):
 # get a batch of noise vectors
 def get_noise_tensor(batch_size, noise_size):
     """batch_size x 24 x noise_size"""
-    noise_tensor = torch.randn((batch_size, 32*8*4*4), dtype=torch.float32)
+    noise_tensor = torch.randn((batch_size, 100), dtype=torch.float32)
     return noise_tensor
 
 def print_performances(header, start_time, loss_g, loss_d, lr_g, lr_d, e):

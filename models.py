@@ -20,69 +20,50 @@ def getModels(cfg, device, checkpoint=None):
         print("Start a new training from epoch 0")
     return net_g, net_d
 
-class pixel_shuffle(nn.Module):
-    def __init__(self, scale_factor):
-        super(pixel_shuffle, self).__init__()
-        self.scale_factor = scale_factor
-
-    def forward(self, input):
-        scale_factor = self.scale_factor
-        _, in_channels, in_height, in_width = input.shape
-
-        in_channels = int(in_channels)
-        in_height = int(in_height)
-        in_width = int(in_width)
-
-        out_channels = in_channels // (scale_factor * scale_factor)
-        out_height = in_height * scale_factor
-        out_width = in_width * scale_factor
-
-        if scale_factor >= 1:
-            input_view = input.view([-1, out_channels, scale_factor, scale_factor, in_height, in_width])
-            shuffle_out = input_view.permute(0, 1, 4, 2, 5, 3)
-
-        return shuffle_out.contiguous().view([-1, out_channels, out_height, out_width])
-
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
         # layer1输入的是一个100x1x1的随机噪声, 输出尺寸(ngf*8)x4x4
         self.ngf = 32
-        #self.fc = nn.Linear(100, self.ngf*8*4*4)
-        self.block0 = G_Block(self.ngf * 8, self.ngf * 8)#4x4
-        self.block1 = G_Block(self.ngf * 8, self.ngf * 8)#4x4
-        self.block2 = G_Block(self.ngf * 8, self.ngf * 8)#8x8
-        self.block3 = G_Block(self.ngf * 8, self.ngf * 8)#16x16
-        self.block4 = G_Block(self.ngf * 8, self.ngf * 4)#32x32
-        self.block5 = G_Block(self.ngf * 4, self.ngf * 2)#64x64
-        self.block6 = G_Block(self.ngf * 2, self.ngf * 1)#128x128
+        """self.rot_linear_1 = nn.Linear(24*3, 64)
+        self.rot_linear_2 = nn.Linear(64, 32)"""
+        self.fc = nn.Linear(100, self.ngf*8*4*4)
+        self.block0 = G_Block(self.ngf * 8, self.ngf * 8)
+        self.block1 = G_Block(self.ngf * 8, self.ngf * 8)
+        self.block2 = G_Block(self.ngf * 8, self.ngf * 8)
+        self.block3 = G_Block(self.ngf * 8, self.ngf * 8)
+        self.block4 = G_Block(self.ngf * 8, self.ngf * 4)
+        self.block5 = G_Block(self.ngf * 4, self.ngf * 2)
+        self.block6 = G_Block(self.ngf * 2, self.ngf * 1)
 
 
         self.conv_img = nn.Sequential(
             nn.LeakyReLU(0.2,inplace=True),
-            nn.Conv2d(self.ngf * 1, 3, 3, 1, 1),
+            nn.Conv2d(self.ngf, 3, 3, 1, 1),
             nn.Tanh(),
         )
         
     def forward(self, noise, sentence_vector, rot_vec):
         batch_s = sentence_vector.size(0)
         #out = self.fc(noise)
+        #rot_vec = self.rot_linear_2(self.rot_linear_1(rot_vec.view(batch_s, 24*3)))
         c = torch.cat((sentence_vector, rot_vec.view(batch_s, 24*3)), 1)
-        out = noise.view(batch_s, 8*self.ngf, 4, 4)
+        #c = sentence_vector
+        out = self.fc(noise).view(batch_s, 8*self.ngf, 4, 4)
 
-        out = self.block0(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block1(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block2(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block3(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block4(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block5(out,c)
-        out = F.interpolate(out, scale_factor=2)
-        out = self.block6(out,c)
+        out = self.block0(out,c) # 256 => 256
+        out = F.interpolate(out, scale_factor=2) # 4x4 => 8x8
+        out = self.block1(out,c) # 256 => 256
+        out = F.interpolate(out, scale_factor=2) # 8x8 => 16x16
+        out = self.block2(out,c) # 256 => 256
+        out = F.interpolate(out, scale_factor=2) # 16x16 => 32x32
+        out = self.block3(out,c) # 256 => 256
+        out = F.interpolate(out, scale_factor=2) # 32x32 => 64x64
+        out = self.block4(out,c) # 256 => 128
+        out = F.interpolate(out, scale_factor=2) # 64x64 => 128x128
+        out = self.block5(out,c) # 128 => 64
+        out = F.interpolate(out, scale_factor=2) # 128x128 => 256x256
+        out = self.block6(out,c) # 64 => 32
 
         out = self.conv_img(out)
         return out
@@ -162,13 +143,35 @@ class affine(nn.Module):
         bias = bias.unsqueeze(-1).unsqueeze(-1).expand(size)
         return weight * x + bias	
 
+class D_GET_LOGITS(nn.Module):
+    def __init__(self, ndf):
+        super(D_GET_LOGITS, self).__init__()
+        self.df_dim = ndf
+        """self.rot_linear_1 = nn.Linear(24*3, 64)
+        self.rot_linear_2 = nn.Linear(64, 32)"""
+
+        self.joint_conv = nn.Sequential(
+            nn.Conv2d(ndf * 16+256+24*3, ndf * 2, 3, 1, 1, bias=False),
+            nn.LeakyReLU(0.2,inplace=True),
+            nn.Conv2d(ndf * 2, 1, 4, 1, 0, bias=False),
+        )
+
+    def forward(self, out, sentence_vector, rot_vec):
+        batch_s = sentence_vector.size(0)
+        #rot_vec = self.rot_linear_2(self.rot_linear_1(rot_vec.view(batch_s, 24*3)))
+        tensor = torch.cat(
+                            (sentence_vector.view(batch_s, 256, 1, 1).repeat(1, 1, 4, 4),rot_vec.view(batch_s, 24*3, 1, 1).repeat(1, 1, 4, 4)),
+                           	1
+                        )
+        h_c_code = torch.cat((out, tensor), 1)
+        out = self.joint_conv(h_c_code)
+        return out
+
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
-        self.image_size = 64
         self.num_channels = 3
         self.ndf = 32
-        
         self.conv_img = nn.Conv2d(3, self.ndf, 3, 1, 1)# 256,256,32
         self.netD_1 = nn.Sequential(
                 resD(self.ndf, self.ndf * 2),# 128,128,64
@@ -178,27 +181,13 @@ class Discriminator(nn.Module):
                 resD(self.ndf * 16, self.ndf * 16), # 8,8,512
                 resD(self.ndf * 16, self.ndf * 16), # 4,4,512
             )
-        self.joint_conv = nn.Sequential(
-            nn.Conv2d(self.ndf*16+256+24*3, self.ndf*8, 3, 1, 1, bias=False),
-            nn.LeakyReLU(0.2,inplace=True),
-            nn.Conv2d(self.ndf*8, self.ndf*2, 3, 1, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(self.ndf*2, 1, 4, 1, 0, bias=False),
-        )
+        self.COND_DNET = D_GET_LOGITS(self.ndf)
+            
         
-    def forward(self, input_img, sentence_vector, rot_vec):
-        batch_s = sentence_vector.size(0)
+    def forward(self, input_img):
         output = self.conv_img(input_img)
-        output = self.netD_1(output)
-        tensor = torch.cat(
-                            (output,sentence_vector.view(batch_s, 256, 1, 1).repeat(1, 1, 4, 4)),
-                           	1
-                        )
-        tensor = torch.cat(
-                            (tensor,rot_vec.view(batch_s, 24*3, 1, 1).repeat(1, 1, 4, 4)),
-                           	1
-                        )
-        return self.joint_conv(tensor)
+        output = self.netD_1(output)  
+        return output
 
 class resD(nn.Module):
     def __init__(self, fin, fout, downsample=True):
@@ -212,6 +201,10 @@ class resD(nn.Module):
             nn.Conv2d(fout, fout, 3, 1, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
         )
+        """self.conv_r = nn.Sequential(
+            nn.Conv2d(fin, fout, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True)
+        )"""
 
         self.conv_s = nn.Conv2d(fin,fout, 1, stride=1, padding=0)
         self.gamma = nn.Parameter(torch.zeros(1))
